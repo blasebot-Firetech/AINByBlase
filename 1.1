@@ -1,0 +1,1108 @@
+import asyncio
+import json
+import os
+import sys
+import time
+import shutil
+import platform
+import uuid
+import hashlib
+from pathlib import Path
+from urllib.parse import quote_plus
+from urllib.request import urlopen, URLError
+
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QIcon, QFont, QPixmap, QPainter
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QPushButton,
+    QTextEdit,
+    QLabel,
+    QMessageBox,
+    QSplashScreen,
+    QDialog,
+    QLineEdit,
+    QDialogButtonBox,
+)
+
+from playwright.async_api import async_playwright, TimeoutError
+
+# ==============================================================
+# PATHS / CONFIG
+# ==============================================================
+
+if hasattr(sys, "frozen"):
+    WORK_DIR = Path(os.getcwd())  # Folder with EXE
+else:
+    WORK_DIR = Path(__file__).resolve().parent
+
+APP_NAME = "AIN By Blase"
+APP_VERSION = "1.0"  # version part used by updater
+
+URLS_FILE = WORK_DIR / "urls.txt"
+ACCOUNTS_FILE = WORK_DIR / "accounts.json"
+PROXY_FILE = WORK_DIR / "proxies.txt"
+SESSIONS_DIR = WORK_DIR / "sessions"
+ICON_FILE = WORK_DIR / "bsf_fire_icon.ico"
+LICENSE_FILE = WORK_DIR / "license.json"
+SETTINGS_FILE = WORK_DIR / "settings.json"  # for saving proxy toggle state
+
+AMAZON_HOME = "https://www.amazon.co.uk/"
+AMAZON_LOGIN = (
+    "https://www.amazon.co.uk/ap/signin?openid.pape.max_auth_age=0&"
+    "openid.return_to=https%3A%2F%2Fwww.amazon.co.uk%2F%3Fref_%3Dnav_signin&"
+    "openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&"
+    "openid.assoc_handle=gbflex&openid.mode=checkid_setup&"
+    "openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&"
+    "openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0"
+)
+
+LICENSE_API_URL = "https://script.google.com/macros/s/AKfycbz5H9DTfh2SQ0DOkKrO2c8cvVga7rp2KxvxX9IzLZ0PjeWZdZbQLN62PfDNQivQO4Cq/exec"
+
+# Update JSON endpoint you host: { "version": "1.1.0", "url": "...", "changelog": "..." }
+UPDATE_CHECK_URL = ""  # e.g. "https://yourdomain.com/ain_by_blase_update.json"
+
+_gui_logger = None
+
+
+# ==============================================================
+# LOGGER
+# ==============================================================
+
+def set_gui_logger(fn):
+    global _gui_logger
+    _gui_logger = fn
+
+
+def log(msg: str):
+    msg = str(msg)
+    print(msg)
+    if _gui_logger:
+        _gui_logger(msg)
+
+
+# ==============================================================
+# ENV + SETTINGS
+# ==============================================================
+
+def ensure_environment():
+    if not SESSIONS_DIR.exists():
+        SESSIONS_DIR.mkdir()
+        log("[SETUP] Created sessions folder.")
+
+    if not URLS_FILE.exists():
+        URLS_FILE.write_text("# Add each Amazon invite URL on its own line\n")
+        log("[SETUP] Created urls.txt in app folder.")
+
+    if not ACCOUNTS_FILE.exists():
+        ACCOUNTS_FILE.write_text(
+            json.dumps({"acc1": {"email": "", "password": ""}}, indent=4)
+        )
+        log("[SETUP] Created accounts.json in app folder.")
+
+    if not PROXY_FILE.exists():
+        PROXY_FILE.write_text("# Add proxies as host:port:user:pass\n")
+        log("[SETUP] Created proxies.txt in app folder.")
+
+    if not SETTINGS_FILE.exists():
+        SETTINGS_FILE.write_text(json.dumps({"use_proxies": False}, indent=2))
+        log("[SETUP] Created settings.json in app folder.")
+
+
+def load_settings():
+    if not SETTINGS_FILE.exists():
+        return {"use_proxies": False}
+    try:
+        return json.loads(SETTINGS_FILE.read_text())
+    except Exception as e:
+        log(f"[SETTINGS] Failed to load settings.json: {e}")
+        return {"use_proxies": False}
+
+
+def save_settings(data: dict):
+    try:
+        SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        log(f"[SETTINGS] Failed to save settings.json: {e}")
+
+
+# ==============================================================
+# LICENSE + HWID HELPERS
+# ==============================================================
+
+def get_hwid() -> str:
+    node = platform.node()
+    system = platform.system()
+    mac = uuid.getnode()
+    raw = f"{node}-{system}-{mac}-BSF_FIRETECH"
+    return hashlib.sha256(raw.encode()).hexdigest().upper()[0:20]
+
+
+def load_saved_license():
+    if LICENSE_FILE.exists():
+        try:
+            data = json.loads(LICENSE_FILE.read_text())
+            email = data.get("email", "").strip()
+            key = data.get("key", "").strip()
+            hwid = data.get("hwid", "").strip()
+            if email and key:
+                return email, key, hwid
+        except Exception as e:
+            log(f"[LICENSE] Failed to read saved license: {e}")
+    return None, None, None
+
+
+def save_license(email: str, key: str, hwid: str):
+    LICENSE_FILE.write_text(
+        json.dumps(
+            {"email": email, "key": key, "hwid": hwid},
+            indent=2
+        )
+    )
+
+
+def check_license_online(email: str, key: str, hwid: str) -> str:
+    """
+    Talk to Google Apps Script API.
+    Returns one of: "VALID", "INVALID", "DISABLED", "HWID_MISMATCH", "ERROR", "DEV_OVERRIDE".
+    """
+    if not LICENSE_API_URL or "REPLACE_ME" in LICENSE_API_URL:
+        log("[LICENSE] WARNING: LICENSE_API_URL not set. DEV MODE → auto VALID.")
+        return "VALID"
+
+    try:
+        url = (
+            f"{LICENSE_API_URL}?"
+            f"email={quote_plus(email)}&"
+            f"key={quote_plus(key)}&"
+            f"hwid={quote_plus(hwid)}"
+        )
+        log(f"[LICENSE] Checking license online: {url}")
+        with urlopen(url, timeout=10) as resp:
+            body = resp.read().decode().strip()
+        log(f"[LICENSE] Raw response: {body}")
+
+        try:
+            data = json.loads(body)
+            status = str(data.get("status", "ERROR")).upper()
+        except Exception:
+            status = body.upper()
+
+        if status not in ("VALID", "INVALID", "DISABLED", "HWID_MISMATCH", "DEV_OVERRIDE"):
+            status = "ERROR"
+
+        return status
+
+    except URLError as e:
+        log(f"[LICENSE] Network error during check: {e}")
+        return "ERROR"
+    except Exception as e:
+        log(f"[LICENSE] Unexpected license check error: {e}")
+        return "ERROR"
+
+
+# ==============================================================
+# LICENSE ACTIVATION DIALOG
+# ==============================================================
+
+class LicenseDialog(QDialog):
+    def __init__(self, hwid: str, preset_email: str = "", preset_key: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{APP_NAME} — Activation")
+        self.setModal(True)
+        self.hwid = hwid
+
+        if ICON_FILE.exists():
+            self.setWindowIcon(QIcon(str(ICON_FILE)))
+
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #050505;
+            }
+            QLabel {
+                color: #f5f5f5;
+                font-size: 11pt;
+            }
+            QLineEdit {
+                background-color: #111;
+                color: #ffd966;
+                border: 1px solid #555;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QPushButton {
+                background-color: #1c1c1c;
+                color: #ffd966;
+                border: 1px solid #a87c00;
+                border-radius: 6px;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #262626;
+                border-color: gold;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+
+        title = QLabel("🔥 BSF FireTech — License Activation")
+        title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        layout.addWidget(title)
+
+        info = QLabel("Enter your registered email and license key.\n"
+                      "Your license will be bound to this device.")
+        layout.addWidget(info)
+
+        self.email_edit = QLineEdit()
+        self.email_edit.setPlaceholderText("Email used for purchase")
+        self.email_edit.setText(preset_email)
+        layout.addWidget(self.email_edit)
+
+        self.key_edit = QLineEdit()
+        self.key_edit.setPlaceholderText("License Key (e.g. BSF-XXXXX-XXXXX-XXXXX)")
+        self.key_edit.setText(preset_key)
+        layout.addWidget(self.key_edit)
+
+        hwid_label = QLabel(f"Hardware ID: {hwid}")
+        hwid_label.setStyleSheet("color: #aaaaaa; font-size: 9pt;")
+        layout.addWidget(hwid_label)
+
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #ff6666; font-size: 9pt;")
+        layout.addWidget(self.status_label)
+
+        buttons = QDialogButtonBox()
+        self.ok_btn = buttons.addButton("Activate", QDialogButtonBox.AcceptRole)
+        self.cancel_btn = buttons.addButton("Exit", QDialogButtonBox.RejectRole)
+
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.resize(480, 260)
+
+    def get_values(self):
+        return (
+            self.email_edit.text().strip(),
+            self.key_edit.text().strip(),
+            self.hwid
+        )
+
+    def set_error(self, msg: str):
+        self.status_label.setText(msg)
+
+
+def ensure_valid_license(app: QApplication) -> bool:
+    """
+    Check saved license; if invalid or missing, show activation window.
+    Returns True if app can continue, False to exit.
+    """
+    hwid = get_hwid()
+    email, key, saved_hwid = load_saved_license()
+
+    if email and key:
+        log(f"[LICENSE] Found saved license for {email}, validating...")
+        status = check_license_online(email, key, hwid)
+        if status in ("VALID", "DEV_OVERRIDE"):
+            log("[LICENSE] Saved license is valid.")
+            return True
+        else:
+            QMessageBox.warning(
+                None,
+                APP_NAME,
+                f"Your saved license is no longer valid ({status}).\n"
+                "Please re-activate."
+            )
+
+    while True:
+        dlg = LicenseDialog(hwid, preset_email=email or "", preset_key=key or "")
+        result = dlg.exec()
+
+        if result != QDialog.Accepted:
+            log("[LICENSE] User cancelled activation. Exiting.")
+            return False
+
+        email, key, hwid_now = dlg.get_values()
+
+        if not email or not key:
+            dlg.set_error("Please enter both email and license key.")
+            continue
+
+        status = check_license_online(email, key, hwid_now)
+
+        if status in ("VALID", "DEV_OVERRIDE"):
+            save_license(email, key, hwid_now)
+            QMessageBox.information(
+                None,
+                APP_NAME,
+                "Activation successful.\nWelcome to AIN By Blase 🔥"
+            )
+            return True
+        elif status == "DISABLED":
+            dlg.set_error("This license is disabled. Contact support.")
+        elif status == "HWID_MISMATCH":
+            dlg.set_error("License is already locked to another device.")
+        elif status == "INVALID":
+            dlg.set_error("Invalid email or license key.")
+        else:
+            dlg.set_error("License server error. Please try again.")
+
+
+# ==============================================================
+# LOAD CONFIG FILES
+# ==============================================================
+
+def load_urls():
+    return [x.strip() for x in URLS_FILE.read_text().splitlines() if x.strip()]
+
+
+def load_accounts():
+    try:
+        return json.loads(ACCOUNTS_FILE.read_text())
+    except Exception as e:
+        log(f"[ERROR] Failed to load accounts.json: {e}")
+        return {}
+
+
+def load_proxies():
+    """Load proxies from proxies.txt (host:port:user:pass)."""
+    if not PROXY_FILE.exists():
+        return []
+    return [
+        line.strip()
+        for line in PROXY_FILE.read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+
+def parse_proxy(proxy_raw: str):
+    """Parse host:port:user:pass (allow extra ':' in password/flags)."""
+    try:
+        parts = proxy_raw.split(":")
+        if len(parts) < 4:
+            raise ValueError("Not enough parts in proxy string")
+        host = parts[0]
+        port = parts[1]
+        user = parts[2]
+        pw = ":".join(parts[3:])  # supports extra flags after password
+        return {
+            "server": f"http://{host}:{port}",
+            "username": user,
+            "password": pw,
+        }
+    except Exception as e:
+        log(f"[PROXY] Failed to parse proxy '{proxy_raw}': {e}")
+        return None
+
+
+# ==============================================================
+# PAGE / IP HELPERS
+# ==============================================================
+
+async def is_logged_in(page):
+    try:
+        await page.wait_for_selector("#nav-link-accountList-nav-line-1", timeout=2000)
+        txt = await page.inner_text("#nav-link-accountList-nav-line-1")
+        txt = txt.strip().lower()
+        return txt not in ["hello, sign in", ""]
+    except:
+        return False
+
+
+async def find_in_iframes(page, selector):
+    try:
+        loc = page.locator(selector)
+        await loc.wait_for(timeout=400)
+        return loc
+    except:
+        pass
+
+    for frame in page.frames:
+        try:
+            loc = frame.locator(selector)
+            await loc.wait_for(timeout=400)
+            return loc
+        except:
+            pass
+
+    return None
+
+
+async def fetch_ip(context):
+    """
+    Gets external IP via https://api.ipify.org?format=json
+    Returns (ip, error_str_or_None)
+    """
+    try:
+        page = await context.new_page()
+        await page.goto("https://api.ipify.org?format=json", timeout=15000)
+        body = await page.text_content("body")
+        if not body:
+            return None, "No response body"
+        try:
+            data = json.loads(body)
+            ip = data.get("ip", "").strip()
+        except Exception:
+            ip = body.strip()
+        if not ip:
+            return None, "IP not found in response"
+        return ip, None
+    except Exception as e:
+        return None, str(e)
+
+
+# ==============================================================
+# PASSKEY: STOP & WAIT WHILE YOU AUTH
+# ==============================================================
+
+async def wait_for_passkey_completion(page):
+    log("[INFO] Waiting for passkey authentication...")
+
+    passkey_selectors = [
+        "text=Use a passkey",
+        "text=Continue with passkey",
+        "text=Sign in with passkey",
+        "text=Windows Hello",
+        "text=Passkey",
+        "#ap-login-with-passkey",
+    ]
+
+    passkey_visible = False
+
+    while True:
+        url = page.url.lower()
+
+        if await is_logged_in(page):
+            log("[OK] Login detected. Continuing bot...")
+            return True
+
+        if passkey_visible and "signin" not in url and "ap" not in url and "login" not in url:
+            log("[OK] Redirected away from login page after passkey. Continuing.")
+            return True
+
+        for sel in passkey_selectors:
+            try:
+                if await page.locator(sel).is_visible():
+                    if not passkey_visible:
+                        log("[INFO] Passkey screen detected. Waiting for your authentication…")
+                        passkey_visible = True
+                    break
+            except:
+                pass
+
+        await page.wait_for_timeout(300)
+
+
+# ==============================================================
+# LOGIN FLOW
+# ==============================================================
+
+async def fill_email(page, email):
+    log("[INFO] Searching for email input...")
+    selectors = [
+        "#ap_email",
+        "input[name='email']",
+        "input[type='email']",
+        "input[id*='email']",
+        "input[autocomplete='username']",
+    ]
+
+    for _ in range(100):
+        for sel in selectors:
+            try:
+                field = page.locator(sel)
+                if await field.is_visible(timeout=200):
+                    await field.fill(email)
+                    log(f"[OK] Email filled using selector: {sel}")
+                    try:
+                        btn = page.locator("#continue")
+                        if await btn.is_visible():
+                            await btn.click()
+                            log("[OK] Continue clicked.")
+                    except:
+                        pass
+                    return True
+            except:
+                pass
+        await page.wait_for_timeout(200)
+
+    log("[ERROR] Email field not found.")
+    return False
+
+
+async def fill_password(page, pw):
+    log("[INFO] Waiting for password field...")
+    for _ in range(60):
+        try:
+            field = page.locator("#ap_password")
+            if await field.is_visible():
+                await field.fill(pw)
+                log("[OK] Password filled. YOU must click Sign-In.")
+                return True
+        except:
+            pass
+        await page.wait_for_timeout(200)
+
+    log("[ERROR] Password field not found.")
+    return False
+
+
+async def login_account(page, email, password):
+    log("[INFO] Opening login page...")
+    await page.goto(AMAZON_LOGIN, wait_until="domcontentloaded")
+
+    await fill_email(page, email)
+    await fill_password(page, password)
+
+    await wait_for_passkey_completion(page)
+
+    return await is_logged_in(page)
+
+
+# ==============================================================
+# INVITE WORKFLOW
+# ==============================================================
+
+async def request_invite(page, url):
+    try:
+        await page.goto(url, wait_until="domcontentloaded")
+    except TimeoutError:
+        return "[ERROR] Timeout opening URL."
+
+    for label in ["Request invite", "Request an invite", "Request Invitation", "Request"]:
+        try:
+            btn = page.get_by_role("button", name=label, exact=False)
+            if await btn.is_visible():
+                await btn.click()
+                await page.wait_for_timeout(500)
+                return "[OK] Invite requested"
+        except:
+            pass
+
+    return "[WARN] Invite button not found"
+
+
+# ==============================================================
+# IP LEAK CHECK (direct vs proxy)
+# ==============================================================
+
+async def ip_leak_check(pw, use_proxies: bool, proxies: list):
+    log("[IP] Starting IP leak check...")
+
+    # Direct IP (no proxy)
+    try:
+        b1 = await pw.chromium.launch(headless=True)
+        c1 = await b1.new_context()
+        ip_direct, err_direct = await fetch_ip(c1)
+        await b1.close()
+
+        if ip_direct:
+            log(f"[IP] Direct connection IP: {ip_direct}")
+        else:
+            log(f"[IP] Direct IP check failed: {err_direct}")
+    except Exception as e:
+        ip_direct = None
+        log(f"[IP] Direct IP check error: {e}")
+
+    # Proxy IP
+    if use_proxies and proxies:
+        proxy_raw = proxies[0]
+        proxy_cfg = parse_proxy(proxy_raw)
+        if not proxy_cfg:
+            log(f"[IP] Cannot parse first proxy for IP test: {proxy_raw}")
+            return
+
+        try:
+            b2 = await pw.chromium.launch(headless=True, proxy=proxy_cfg)
+            c2 = await b2.new_context()
+            ip_proxy, err_proxy = await fetch_ip(c2)
+            await b2.close()
+
+            if ip_proxy:
+                log(f"[IP] Proxy IP via [{proxy_raw}]: {ip_proxy}")
+                if ip_direct and ip_direct == ip_proxy:
+                    log("[IP] WARNING: Proxy IP matches direct IP → possible leak.")
+            else:
+                log(f"[IP] Proxy IP check failed: {err_proxy}")
+        except Exception as e:
+            log(f"[IP] Proxy IP check error: {e}")
+    else:
+        log("[IP] Proxies OFF or empty → skipping proxy IP check.")
+
+
+# ==============================================================
+# PROCESS ONE ACCOUNT  (WITH ROTATING PROXY)
+# ==============================================================
+
+async def process_account(pw, name, creds, urls, proxy_raw=None):
+    log(f"\n====== ACCOUNT {name} — {creds['email']} ======")
+
+    proxy_config = None
+    if proxy_raw:
+        proxy_config = parse_proxy(proxy_raw)
+        if proxy_config:
+            log(f"[PROXY] Using proxy for {name}: {proxy_config['server']}")
+        else:
+            log(f"[PROXY] Invalid proxy for {name}, running without proxy.")
+
+    session_file = SESSIONS_DIR / f"{name}.json"
+
+    if proxy_config:
+        browser = await pw.chromium.launch(headless=False, proxy=proxy_config)
+    else:
+        browser = await pw.chromium.launch(headless=False)
+
+    if session_file.exists():
+        context = await browser.new_context(storage_state=str(session_file))
+    else:
+        context = await browser.new_context()
+
+    page = await context.new_page()
+    await page.goto(AMAZON_HOME)
+
+    if not await is_logged_in(page):
+        await login_account(page, creds["email"], creds["password"])
+
+    await context.storage_state(path=str(session_file))
+    log("[INFO] Session saved for this account.")
+
+    for i, url in enumerate(urls, start=1):
+        log(f"[{name}] {i}/{len(urls)} — {url}")
+        res = await request_invite(page, url)
+        log(res)
+
+    await browser.close()
+
+
+# ==============================================================
+# BOT MAIN LOOP (ROTATES PROXIES PER ACCOUNT)
+# ==============================================================
+
+async def bot_main(use_proxies: bool = False):
+    ensure_environment()
+
+    urls = load_urls()
+    accounts = load_accounts()
+    proxies = load_proxies()
+
+    if not urls:
+        log("[ERROR] No URLs found in urls.txt")
+        return
+
+    if not accounts:
+        log("[ERROR] No accounts found in accounts.json")
+        return
+
+    if use_proxies and not proxies:
+        log("[PROXY] Proxies are ON but proxies.txt is empty. Running WITHOUT proxies.")
+
+    async with async_playwright() as pw:
+        # IP LEAK CHECK first
+        await ip_leak_check(pw, use_proxies, proxies)
+
+        proxy_index = 0
+        for name, creds in accounts.items():
+            proxy_raw = None
+            if use_proxies and proxies:
+                proxy_raw = proxies[proxy_index % len(proxies)]
+                proxy_index += 1
+
+            await process_account(pw, name, creds, urls, proxy_raw)
+
+    log("\n[DONE] All accounts processed.\n")
+
+
+# ==============================================================
+# PROXY TESTER
+# ==============================================================
+
+async def proxy_test_main():
+    ensure_environment()
+    proxies = load_proxies()
+
+    if not proxies:
+        log("[PROXY TEST] No proxies found in proxies.txt")
+        return
+
+    log(f"[PROXY TEST] Testing {len(proxies)} proxies...")
+
+    async with async_playwright() as pw:
+        for i, proxy_raw in enumerate(proxies, start=1):
+            log(f"[PROXY TEST] ({i}/{len(proxies)}) {proxy_raw}")
+            proxy_cfg = parse_proxy(proxy_raw)
+            if not proxy_cfg:
+                log("[PROXY TEST]  -> SKIP (parse failed)")
+                continue
+
+            start = time.monotonic()
+            try:
+                browser = await pw.chromium.launch(headless=True, proxy=proxy_cfg)
+                context = await browser.new_context()
+                ip, err = await fetch_ip(context)
+                await browser.close()
+
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+
+                if ip:
+                    log(f"[PROXY TEST]  -> OK  IP={ip}  ({elapsed_ms} ms)")
+                else:
+                    log(f"[PROXY TEST]  -> FAIL  ({elapsed_ms} ms)  Reason: {err}")
+            except Exception as e:
+                elapsed_ms = int((time.monotonic() - start) * 1000)
+                log(f"[PROXY TEST]  -> ERROR  ({elapsed_ms} ms)  {e}")
+
+    log("[PROXY TEST] Finished.\n")
+
+
+# ==============================================================
+# WORKER THREADS
+# ==============================================================
+
+class BotWorker(QThread):
+    log_signal = Signal(str)
+
+    def __init__(self, use_proxies: bool, parent=None):
+        super().__init__(parent)
+        self.use_proxies = use_proxies
+
+    def run(self):
+        set_gui_logger(lambda msg: self.log_signal.emit(msg))
+        try:
+            asyncio.run(bot_main(use_proxies=self.use_proxies))
+        except Exception as e:
+            self.log_signal.emit(f"[FATAL] {e}")
+
+
+class ProxyTestWorker(QThread):
+    log_signal = Signal(str)
+
+    def run(self):
+        set_gui_logger(lambda msg: self.log_signal.emit(msg))
+        try:
+            asyncio.run(proxy_test_main())
+        except Exception as e:
+            self.log_signal.emit(f"[PROXY TEST FATAL] {e}")
+
+
+# ==============================================================
+# UPDATE CHECKER
+# ==============================================================
+
+def is_version_newer(current: str, remote: str) -> bool:
+    def parse(v):
+        return [int(x) for x in v.split(".") if x.isdigit()]
+
+    try:
+        c = parse(current)
+        r = parse(remote)
+        return r > c
+    except Exception:
+        return False
+
+
+def check_for_updates_gui(parent: QMainWindow):
+    if not UPDATE_CHECK_URL:
+        QMessageBox.information(
+            parent,
+            APP_NAME,
+            "Update check URL is not configured yet.\n"
+            "Set UPDATE_CHECK_URL in the script when you're ready to host updates."
+        )
+        return
+
+    try:
+        with urlopen(UPDATE_CHECK_URL, timeout=8) as resp:
+            body = resp.read().decode().strip()
+        data = json.loads(body)
+    except Exception as e:
+        QMessageBox.warning(
+            parent,
+            APP_NAME,
+            f"Failed to check for updates:\n{e}"
+        )
+        return
+
+    remote_ver = str(data.get("version", "")).strip()
+    download_url = str(data.get("url", "")).strip()
+    changelog = str(data.get("changelog", "")).strip()
+
+    if not remote_ver:
+        QMessageBox.warning(parent, APP_NAME, "Update server response missing 'version'.")
+        return
+
+    if is_version_newer(APP_VERSION, remote_ver):
+        msg = f"A new version is available: {remote_ver}\n\nCurrent: {APP_VERSION}\n"
+        if changelog:
+            msg += f"\nChanges:\n{changelog}\n"
+        if download_url:
+            msg += "\nDo you want to open the download page?"
+
+            reply = QMessageBox.question(
+                parent,
+                APP_NAME,
+                msg,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply == QMessageBox.Yes:
+                try:
+                    os.startfile(download_url)
+                except Exception:
+                    QMessageBox.information(
+                        parent,
+                        APP_NAME,
+                        f"Open this URL in your browser:\n{download_url}"
+                    )
+        else:
+            QMessageBox.information(parent, APP_NAME, msg)
+    else:
+        QMessageBox.information(
+            parent,
+            APP_NAME,
+            f"You are up to date.\nCurrent version: {APP_VERSION}\nRemote reported: {remote_ver}"
+        )
+
+
+# ==============================================================
+# MAIN WINDOW (GUI)
+# ==============================================================
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} Fire Edition")
+        if ICON_FILE.exists():
+            self.setWindowIcon(QIcon(str(ICON_FILE)))
+
+        self.resize(950, 620)
+
+        self.setStyleSheet("""
+            QMainWindow { background-color: #050505; }
+            QTextEdit {
+                background-color: #0a0a0a;
+                color: gold;
+                border: 1px solid #333;
+                font-family: Consolas;
+                font-size: 12pt;
+            }
+            QPushButton {
+                background-color: #1a1a1a;
+                border: 1px solid #a87c00;
+                border-radius: 6px;
+                padding: 8px 15px;
+                color: #ffcc33;
+            }
+            QPushButton:hover {
+                background-color: #262626;
+                border: 1px solid gold;
+            }
+            QLabel#titleLabel {
+                color: gold;
+                font-size: 24pt;
+                font-weight: bold;
+            }
+            QLabel#subtitleLabel {
+                color: #bbb;
+                font-size: 12pt;
+            }
+        """)
+
+        # load settings for proxy toggle
+        self.settings = load_settings()
+        self.use_proxies = bool(self.settings.get("use_proxies", False))
+
+        main = QWidget()
+        self.setCentralWidget(main)
+
+        layout = QVBoxLayout(main)
+
+        title = QLabel("🔥 AIN By Blase — Fire Edition")
+        title.setObjectName("titleLabel")
+
+        subtitle = QLabel("Automated Amazon Invitation Engine (Licensed)")
+        subtitle.setObjectName("subtitleLabel")
+
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        row = QHBoxLayout()
+        self.btn_run = QPushButton("Run Bot")
+
+        # proxy toggle button
+        self.btn_proxy_toggle = QPushButton()
+        self.btn_proxy_toggle.setCheckable(True)
+        self.btn_proxy_toggle.setChecked(self.use_proxies)
+
+        self.btn_test_proxies = QPushButton("Test Proxies")
+        self.btn_urls = QPushButton("Open URLs")
+        self.btn_accounts = QPushButton("Open Accounts")
+        self.btn_clear = QPushButton("Clear Sessions")
+        self.btn_update = QPushButton("Check Updates")
+
+        row.addWidget(self.btn_run)
+        row.addWidget(self.btn_proxy_toggle)
+        row.addWidget(self.btn_test_proxies)
+        row.addWidget(self.btn_urls)
+        row.addWidget(self.btn_accounts)
+        row.addWidget(self.btn_clear)
+        row.addWidget(self.btn_update)
+
+        layout.addLayout(row)
+
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        layout.addWidget(self.log_box)
+
+        self.worker = None
+        self.proxy_worker = None
+
+        self.btn_run.clicked.connect(self.start_bot)
+        self.btn_proxy_toggle.clicked.connect(self.toggle_proxies)
+        self.btn_test_proxies.clicked.connect(self.start_proxy_test)
+        self.btn_urls.clicked.connect(lambda: os.startfile(URLS_FILE))
+        self.btn_accounts.clicked.connect(lambda: os.startfile(ACCOUNTS_FILE))
+        self.btn_clear.clicked.connect(self.clear_sessions)
+        self.btn_update.clicked.connect(self.check_updates)
+
+        self.apply_proxy_button_style()
+
+    # --- proxy toggle visual style ---
+    def apply_proxy_button_style(self):
+        if self.use_proxies:
+            self.btn_proxy_toggle.setText("Proxies: ON")
+            self.btn_proxy_toggle.setStyleSheet(
+                "QPushButton {"
+                " background-color: #0f3d1a;"
+                " border: 1px solid #00ff66;"
+                " border-radius: 6px;"
+                " padding: 8px 15px;"
+                " color: #00ff66;"
+                "}"
+                "QPushButton:hover {"
+                " background-color: #145226;"
+                " border: 1px solid #00ff88;"
+                "}"
+            )
+        else:
+            self.btn_proxy_toggle.setText("Proxies: OFF")
+            self.btn_proxy_toggle.setStyleSheet(
+                "QPushButton {"
+                " background-color: #3d0f0f;"
+                " border: 1px solid #ff5555;"
+                " border-radius: 6px;"
+                " padding: 8px 15px;"
+                " color: #ff5555;"
+                "}"
+                "QPushButton:hover {"
+                " background-color: #5a1717;"
+                " border: 1px solid #ff7777;"
+                "}"
+            )
+
+    def toggle_proxies(self):
+        self.use_proxies = not self.use_proxies
+        self.settings["use_proxies"] = self.use_proxies
+        save_settings(self.settings)
+        self.apply_proxy_button_style()
+        if self.use_proxies:
+            self.append_log("[PROXY] Proxies ENABLED (settings saved).")
+        else:
+            self.append_log("[PROXY] Proxies DISABLED (settings saved).")
+
+    def append_log(self, msg):
+        self.log_box.append(msg)
+
+    def start_bot(self):
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, APP_NAME, "Bot is already running.")
+            return
+        if self.proxy_worker and self.proxy_worker.isRunning():
+            QMessageBox.information(self, APP_NAME, "Proxy test is running. Please wait.")
+            return
+
+        self.worker = BotWorker(use_proxies=self.use_proxies)
+        self.worker.log_signal.connect(self.append_log)
+        self.worker.start()
+
+    def start_proxy_test(self):
+        if self.proxy_worker and self.proxy_worker.isRunning():
+            QMessageBox.information(self, APP_NAME, "Proxy test is already running.")
+            return
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(self, APP_NAME, "Bot is running. Stop it before testing proxies.")
+            return
+
+        self.proxy_worker = ProxyTestWorker()
+        self.proxy_worker.log_signal.connect(self.append_log)
+        self.proxy_worker.start()
+
+    def clear_sessions(self):
+        if SESSIONS_DIR.exists():
+            shutil.rmtree(SESSIONS_DIR)
+        SESSIONS_DIR.mkdir()
+        self.append_log("[INFO] Sessions cleared.")
+
+    def check_updates(self):
+        check_for_updates_gui(self)
+
+
+# ==============================================================
+# SPLASH SCREEN
+# ==============================================================
+
+def show_splash(app):
+    pixmap = QPixmap(520, 300)
+    pixmap.fill(Qt.black)
+
+    splash = QSplashScreen(pixmap)
+    splash.show()
+
+    painter = QPainter(splash)
+    painter.setRenderHint(QPainter.Antialiasing)
+
+    painter.setFont(QFont("Segoe UI", 20, QFont.Bold))
+    painter.setPen(Qt.yellow)
+    painter.drawText(0, 120, 520, 40, Qt.AlignHCenter,
+                     "BSF FireTech — Initializing System...")
+
+    painter.setFont(QFont("Segoe UI", 12))
+    painter.setPen(Qt.white)
+    painter.drawText(0, 160, 520, 40, Qt.AlignHCenter,
+                     "Amazon Invitation Engine Loading...!")
+
+    painter.end()
+    app.processEvents()
+    time.sleep(2)
+    return splash
+
+
+# ==============================================================
+# MAIN ENTRY
+# ==============================================================
+
+def main():
+    ensure_environment()
+
+    app = QApplication([])
+    if ICON_FILE.exists():
+        app.setWindowIcon(QIcon(str(ICON_FILE)))
+
+    if not ensure_valid_license(app):
+        return
+
+    splash = show_splash(app)
+
+    win = MainWindow()
+    win.show()
+    splash.finish(win)
+
+    app.exec()
+
+
+if __name__ == "__main__":
+    main()
