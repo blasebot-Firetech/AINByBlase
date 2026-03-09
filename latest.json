@@ -1,5 +1,5 @@
 {
   "version": "1.3",
-  "download": "https://raw.githubusercontent.com/blasebot-Firetech/AINByBlase/main/EM.exe",
+  "download": "https://github.com/blasebot-Firetech/AINByBlase/releases/download/v1.3/EM.exe",
   "notes": "Added IMAP IDLE instant detection"
 }
