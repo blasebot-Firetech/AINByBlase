@@ -5,7 +5,7 @@
   },
   "modules": {
     "AIN": {
-      "version": "1.1",
+      "version": "1.2",
       "download": "https://github.com/blasebot-Firetech/AINByBlase/releases/download/v1.1/AIN.exe"
     },
     "EM": {
