@@ -1,7 +1,7 @@
 {
   "launcher": {
     "version": "1.0",
-    "download": "https://raw.githubusercontent.com/blasebot-Firetech/AINByBlase/main/Launcher.exe"
+    "download": "https://github.com/blasebot-Firetech/AINByBlase/releases/download/v1.1/AIN.exe"
   },
   "modules": {
     "AIN": {
@@ -10,7 +10,7 @@
     },
     "EM": {
       "version": "1.0",
-      "download": "https://raw.githubusercontent.com/blasebot-Firetech/AINByBlase/main/EM.exe"
+      "download": "https://github.com/blasebot-Firetech/AINByBlase/releases/download/v1.1/AIN.exe"
     }
   }
 }
