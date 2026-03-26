@@ -1,19 +1,19 @@
 {
   "launcher": {
-    "version": "0.0.1",
+    "version": "1.0",
     "download": "https://raw.githubusercontent.com/blasebot-Firetech/AINByBlase/main/Launcher.exe"
   },
   "modules": {
     "AIN": {
-      "version": "0.0.1",
+      "version": "1.0",
       "download": "https://raw.githubusercontent.com/blasebot-Firetech/AINByBlase/main/AIN.exe"
     },
     "EM": {
-      "version": "0.0.1",
+      "version": "1.0",
       "download": "https://raw.githubusercontent.com/blasebot-Firetech/AINByBlase/main/EM.exe"
     },
     "AIN-OD": {
-      "version": "0.0.1",
+      "version": "1.0",
       "download": "https://github.com/blasebot-Firetech/AINByBlase/releases/download/v1.0/ainod.exe"
     }
   }
